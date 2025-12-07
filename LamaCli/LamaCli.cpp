@@ -804,6 +804,16 @@ void Enrollment_thread()
 
         if (chara == 1) {
 
+            std::string speakID = ReadUTF8Input();
+
+            if (speakID.empty()) {
+                WriteUTF8("⚠ キャラクターNoを入力してください\n");
+                continue;
+            }
+
+            g_voice.style_id = std::stoi(speakID);
+
+
             WriteUTF8("しゃべる文章を入力: ");
             std::string speakString = ReadUTF8Input();
 
@@ -819,14 +829,6 @@ void Enrollment_thread()
             WriteUTF8("もち子さん\tノーマル\t20\n");
             WriteUTF8("\nキャラクターNoを入力: ");
 
-            std::string speakID = ReadUTF8Input();
-
-            if (speakID.empty()) {
-                WriteUTF8("⚠ キャラクターNoを入力してください\n");
-                continue;
-            }
-
-            g_voice.style_id = std::stoi(speakID);
 
             // 音声キューとバッファをクリア
             {
@@ -1410,6 +1412,90 @@ static void sigint_handler(int signo) {
     }
 }
 #endif
+
+// ================================
+   // ★ 5 回録音して平均化して話者登録する関数
+   //    enrollSpeakerMulti5()
+   // ================================
+bool enrollSpeakerMulti5(SpeakerIdentifier& identifier,
+    const std::string& speakerName,
+    const std::vector<std::vector<float>>& audioList)
+{
+    if (audioList.size() != 5) {
+        std::cerr << "[Error] audioList must contain exactly 5 recordings." << std::endl;
+        return false;
+    }
+
+    std::vector<std::vector<float>> embeddings;
+    embeddings.reserve(5);
+
+    // 5回分の埋め込みを生成
+    for (int i = 0; i < 5; i++) {
+        const auto& audio = audioList[i];
+        if (audio.empty()) {
+            std::cerr << "[Error] One of the recordings is empty." << std::endl;
+            return false;
+        }
+
+        auto mel = identifier.melExtractor_->extract(audio);
+        auto emb = identifier.computeEmbeddingByChunks(mel);
+
+        if (emb.empty()) {
+            std::cerr << "[Error] Failed to extract embedding (#" << i << ")." << std::endl;
+            return false;
+        }
+
+        // 正規化
+        identifier.l2normalize(emb);
+        embeddings.push_back(std::move(emb));
+    }
+
+    // ================================
+    // ★ 5つの埋め込みを平均化
+    // ================================
+    std::vector<float> avg(embeddings[0].size(), 0.0f);
+
+    for (size_t d = 0; d < avg.size(); d++) {
+        float sum = 0.0f;
+        for (int i = 0; i < 5; i++) sum += embeddings[i][d];
+        avg[d] = sum / 5.0f;
+    }
+
+    // 最後にもう一度 L2 正規化
+    identifier.l2normalize(avg);
+
+    // ================================
+    // ★ SpeakerModel として保存
+    // ================================
+    SpeakerModel model;
+    model.name = speakerName;
+    model.embedding = avg;
+
+    std::filesystem::path dir = identifier.modelDir_;
+    if (!std::filesystem::exists(dir)) std::filesystem::create_directories(dir);
+
+    std::filesystem::path file = dir / std::filesystem::u8path(speakerName + ".bin");
+
+    if (!model.saveToFile(file)) {
+        std::cerr << "[Error] Failed to save averaged speaker model." << std::endl;
+        return false;
+    }
+
+    // メモリ上のリストへ反映
+    bool found = false;
+    for (auto& spk : identifier.speakers_) {
+        if (spk.name == speakerName) {
+            spk = model;
+            found = true;
+            break;
+        }
+    }
+    if (!found) identifier.speakers_.push_back(model);
+
+    std::cout << "[SpeakerID] Enrolled (5‑recording averaged): " << speakerName << std::endl;
+    return true;
+}
+
 
 int main(int argc, char** argv) {
 

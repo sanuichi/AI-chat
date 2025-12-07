@@ -139,7 +139,8 @@ namespace SpeakerID {
                 }
 
                 Eigen::VectorXd mel = melFilterbanks_ * power;
-                mel = (mel.array() + 1e-10).log();
+                //mel = (mel.array() + 1e-10).log();
+				mel = (mel.array() + 1e-10).log10() * 10.0;
                 melSpec.col(i) = mel;
             }
 
@@ -474,6 +475,90 @@ namespace SpeakerID {
             loadSpeakerModels();
         }
 
+        // ================================
+           // ★ 5 回録音して平均化して話者登録する関数
+           //    enrollSpeakerMulti5()
+           // ================================
+        bool enrollSpeakerMulti5(
+            const std::string& speakerName,
+            const std::vector<std::vector<float>>& audioList)
+        {
+            if (audioList.size() != 5) {
+                std::cerr << "[Error] audioList must contain exactly 5 recordings." << std::endl;
+                return false;
+            }
+
+            std::vector<std::vector<float>> embeddings;
+            embeddings.reserve(5);
+
+            // 5回分の埋め込みを生成
+            for (int i = 0; i < 5; i++) {
+                const auto& audio = audioList[i];
+                if (audio.empty()) {
+                    std::cerr << "[Error] One of the recordings is empty." << std::endl;
+                    return false;
+                }
+
+                auto mel = melExtractor_->extract(audio);
+                auto emb = computeEmbeddingByChunks(mel);
+
+                if (emb.empty()) {
+                    std::cerr << "[Error] Failed to extract embedding (#" << i << ")." << std::endl;
+                    return false;
+                }
+
+                // 正規化
+                l2normalize(emb);
+                embeddings.push_back(std::move(emb));
+            }
+
+            // ================================
+            // ★ 5つの埋め込みを平均化
+            // ================================
+            std::vector<float> avg(embeddings[0].size(), 0.0f);
+
+            for (size_t d = 0; d < avg.size(); d++) {
+                float sum = 0.0f;
+                for (int i = 0; i < 5; i++) sum += embeddings[i][d];
+                avg[d] = sum / 5.0f;
+            }
+
+            // 最後にもう一度 L2 正規化
+            l2normalize(avg);
+
+            // ================================
+            // ★ SpeakerModel として保存
+            // ================================
+            SpeakerModel model;
+            model.name = speakerName;
+            model.embedding = avg;
+
+            std::filesystem::path dir = modelDir_;
+            if (!std::filesystem::exists(dir)) std::filesystem::create_directories(dir);
+
+            std::filesystem::path file = dir / std::filesystem::u8path(speakerName + ".bin");
+
+            if (!model.saveToFile(file)) {
+                std::cerr << "[Error] Failed to save averaged speaker model." << std::endl;
+                return false;
+            }
+
+            // メモリ上のリストへ反映
+            bool found = false;
+            for (auto& spk : speakers_) {
+                if (spk.name == speakerName) {
+                    spk = model;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) speakers_.push_back(model);
+
+            std::cout << "[SpeakerID] Enrolled (5‑recording averaged): " << speakerName << std::endl;
+            return true;
+        }
+
+
         bool enrollSpeaker(const std::string& name, const std::vector<float>& audioData) {
             if (name.empty() || audioData.empty()) return false;
 
@@ -619,7 +704,7 @@ namespace SpeakerID {
             return true;
         }
 
-    private:
+    public:
         std::string modelDir_;
         Config config_;
         std::unique_ptr<MelSpectrogramExtractor> melExtractor_;
@@ -797,4 +882,13 @@ namespace SpeakerID {
         }
     };
 
+
+#include "SpeakerIdentifier.h"
+    using namespace SpeakerID;
+
+   
+
 } // namespace SpeakerID
+
+
+
