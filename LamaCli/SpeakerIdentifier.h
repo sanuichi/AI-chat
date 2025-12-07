@@ -139,7 +139,8 @@ namespace SpeakerID {
                 }
 
                 Eigen::VectorXd mel = melFilterbanks_ * power;
-                mel = (mel.array() + 1e-10).log();
+                //mel = (mel.array() + 1e-10).log();
+				mel = (mel.array() + 1e-10).log10() * 10.0;
                 melSpec.col(i) = mel;
             }
 
@@ -619,7 +620,7 @@ namespace SpeakerID {
             return true;
         }
 
-    private:
+    public:
         std::string modelDir_;
         Config config_;
         std::unique_ptr<MelSpectrogramExtractor> melExtractor_;
@@ -797,4 +798,12 @@ namespace SpeakerID {
         }
     };
 
+
+#include "SpeakerIdentifier.h"
+    using namespace SpeakerID;
+
+   
+
 } // namespace SpeakerID
+
+
