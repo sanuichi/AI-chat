@@ -1044,6 +1044,7 @@ void worker_thread_func() {
     int silence_count = 0;
     int active_count = 0;
     std::vector<float> accumulated_chunk;
+    std::vector<float> prev_chunk;
     std::vector<double> recent_rms;
 
     Config config;
@@ -1122,6 +1123,11 @@ void worker_thread_func() {
             if (!recording_started) {
                 recording_started = true;
                 pre_speech_silence = 0;
+                if (!prev_chunk.empty()) {
+                    // 前回の無音チャンクの後半半分だけを追加
+                    size_t offset = prev_chunk.size() / 2;
+                    accumulated_chunk.insert(accumulated_chunk.end(), prev_chunk.begin() + offset, prev_chunk.end());
+                }
                 WriteUTF8("🎤 録音開始！\n");
             }
             silence_count = 0;
@@ -1136,6 +1142,7 @@ void worker_thread_func() {
             else if (!recording_started) {
                 // 録音開始前の無音カウント（タイムアウト用）
                 pre_speech_silence++;
+                prev_chunk = chunk;
             }
         }
 
@@ -1172,12 +1179,12 @@ void worker_thread_func() {
 
 
                 if (to_process.size() >= TARGET_RATE * 0.5) {
-                  //  to_process = trimTrailingSilence(
-                  //      to_process,
-                  //      TARGET_RATE,
-                  //      SILENCE_LIMIT * 0.5,  // 1秒
-                  //      0.2  // 0.2秒残す（Whisper用）
-                  //  );
+                    to_process = trimTrailingSilence(
+                        to_process,
+                        TARGET_RATE,
+                        SILENCE_LIMIT * 0.5,  // 1秒
+                        0.2  // 0.2秒残す（Whisper用）
+                    );
 
                     ///////////////////////////////////////////////////////////
                     // UTF-8 → Shift-JIS変換してファイル名作成

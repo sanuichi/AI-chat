@@ -496,40 +496,209 @@ namespace SpeakerID {
 
             l2normalize(emb);
 
-            // ✅ 既存の話者モデルがあれば統合（Centroid Update）
             SpeakerModel m;
             m.name = name;
             m.embedding = emb;
 
             if (!fs::exists(modelDir_)) fs::create_directories(modelDir_);
             fs::path p = fs::path(modelDir_) / fs::u8path(name + ".bin");
+            bool ok = m.saveToFile(p);
+            if (ok) {
+                speakers_.push_back(m);
+                std::cout << "[SpeakerID] Enrolled: " << name
+                    << " (embedding size: " << emb.size() << ")" << std::endl;
+            }
+            return ok;
+        }
 
-            if (fs::exists(p)) {
-                SpeakerModel existing;
-                if (existing.loadFromFile(p)) {
-                    if (existing.embedding.size() == emb.size()) {
-                        std::cout << "[SpeakerID] Updating existing model for: " << name << std::endl;
-                        for (size_t i = 0; i < emb.size(); ++i) {
-                            m.embedding[i] += existing.embedding[i];
-                        }
-                        l2normalize(m.embedding);
-                    }
+        IdentificationResult identify(const std::vector<float>& audioData) {
+            IdentificationResult result;
+            result.speakerName = "Unknown";
+            result.confidence = -2.0;
+            result.isUnknown = true;
+
+            if (audioData.empty() || speakers_.empty()) return result;
+
+            // 音声長チェック
+            double duration = (double)audioData.size() / config_.sampleRate;
+            if (duration < 0.5) {
+                std::cerr << "[Warning] Audio too short for identification: "
+                    << duration << "s" << std::endl;
+                return result;
+            }
+
+            auto trimmed = trimSilence(audioData);
+            if ((int)trimmed.size() < config_.sampleRate / 2) {
+                if ((int)audioData.size() < config_.sampleRate / 2) return result;
+                trimmed = audioData;
+            }
+
+            auto mel = melExtractor_->extract(trimmed);
+            auto testEmb = computeEmbeddingByChunks(mel);
+            if (testEmb.empty()) return result;
+            l2normalize(testEmb);
+
+            // 埋め込みの品質チェック
+            double embStd = 0.0;
+            double embMean = 0.0;
+            for (auto v : testEmb) embMean += v;
+            embMean /= testEmb.size();
+            for (auto v : testEmb) embStd += (v - embMean) * (v - embMean);
+            embStd = std::sqrt(embStd / testEmb.size());
+
+            std::cout << "[Embedding] size=" << testEmb.size()
+                << " std=" << std::fixed << std::setprecision(4) << embStd << std::endl;
+
+            double maxSim = -2.0;
+            std::string best = "Unknown";
+
+            std::cout << "[Similarity Scores]" << std::endl;
+            for (const auto& s : speakers_) {
+                double sim = StatisticalEmbedding::cosineSimilarity(testEmb, s.embedding);
+                result.allScores.push_back({ s.name, sim });
+                std::cout << "  " << s.name << ": " << std::fixed
+                    << std::setprecision(4) << sim << std::endl;
+                if (sim > maxSim) { maxSim = sim; best = s.name; }
+            }
+
+            std::sort(result.allScores.begin(), result.allScores.end(),
+                [](auto& a, auto& b) { return a.second > b.second; });
+
+            result.confidence = maxSim;
+            result.speakerName = best;
+            result.isUnknown = (maxSim < config_.minConfidence);
+            if (result.isUnknown) result.speakerName = "Unknown";
+
+            return result;
+        }
+
+        std::vector<std::string> getSpeakerNames() const {
+            std::vector<std::string> names;
+            names.reserve(speakers_.size());
+            for (auto& s : speakers_) names.push_back(s.name);
+            return names;
+        }
+
+        size_t getSpeakerCount() const { return speakers_.size(); }
+
+        bool removeSpeaker(const std::string& name) {
+            auto it = std::find_if(speakers_.begin(), speakers_.end(),
+                [&](const SpeakerModel& m) { return m.name == name; });
+            if (it == speakers_.end()) return false;
+            fs::path p = fs::path(modelDir_) / fs::u8path(name + ".bin");
+            try {
+                if (fs::exists(p)) fs::remove(p);
+            }
+                    std::cout << "[ONNX #" << callCount << "] Output: size=" << size
+                        << " range=[" << std::fixed << std::setprecision(3)
+                        << embMin << "," << embMax << "] mean=" << embMean << std::endl;
+                }
+
+                return embedding;
+
+            }
+            catch (const Ort::Exception& e) {
+                std::cerr << "[ONNX Error] " << e.what() << std::endl;
+                return {};
+            }
+        }
+
+    private:
+        std::unique_ptr<Ort::Env> env_;
+        std::unique_ptr<Ort::Session> session_;
+        std::string inputName_;
+        std::string outputName_;
+        std::vector<int64_t> inputShape_;
+        bool initialized_;
+    };
+
+    // ==================== SpeakerModel ====================
+    struct SpeakerModel {
+        std::string name;
+        std::vector<float> embedding;
+
+        bool saveToFile(const fs::path& filename) const {
+            std::ofstream ofs(filename, std::ios::binary);
+            if (!ofs) return false;
+            uint32_t nameLen = static_cast<uint32_t>(name.size());
+            ofs.write(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
+            ofs.write(name.data(), nameLen);
+            uint32_t embSize = static_cast<uint32_t>(embedding.size());
+            ofs.write(reinterpret_cast<const char*>(&embSize), sizeof(embSize));
+            ofs.write(reinterpret_cast<const char*>(embedding.data()), embSize * sizeof(float));
+            return ofs.good();
+        }
+
+        bool loadFromFile(const fs::path& filename) {
+            std::ifstream ifs(filename, std::ios::binary);
+            if (!ifs) return false;
+            uint32_t nameLen = 0;
+            ifs.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+            name.resize(nameLen);
+            ifs.read(&name[0], nameLen);
+            uint32_t embSize = 0;
+            ifs.read(reinterpret_cast<char*>(&embSize), sizeof(embSize));
+            embedding.resize(embSize);
+            ifs.read(reinterpret_cast<char*>(embedding.data()), embSize * sizeof(float));
+            return ifs.good();
+        }
+    };
+
+    // ==================== SpeakerIdentifier (改善版) ====================
+    class SpeakerIdentifier {
+    public:
+        SpeakerIdentifier(const std::string& modelDir,
+            const std::string& onnxModelPath = "",
+            const Config& config = Config())
+            : modelDir_(modelDir), config_(config)
+        {
+            melExtractor_ = std::make_unique<MelSpectrogramExtractor>(config_);
+
+            if (!onnxModelPath.empty()) {
+                onnxModel_ = std::make_unique<ONNXEmbedding>(onnxModelPath, config_);
+                useONNX_ = onnxModel_->isInitialized();
+                if (useONNX_) {
+                    std::cout << "[SpeakerID] Using ONNX embeddings." << std::endl;
+                }
+                else {
+                    std::cerr << "[SpeakerID] ONNX failed; using statistical embeddings." << std::endl;
                 }
             }
 
+            loadSpeakerModels();
+        }
+
+        bool enrollSpeaker(const std::string& name, const std::vector<float>& audioData) {
+            if (name.empty() || audioData.empty()) return false;
+
+            // 音声長チェック
+            double duration = (double)audioData.size() / config_.sampleRate;
+            if (duration < config_.minAudioSeconds) {
+                std::cerr << "[Warning] Audio too short: " << duration
+                    << "s (minimum " << config_.minAudioSeconds << "s)" << std::endl;
+            }
+
+            auto trimmed = trimSilence(audioData);
+            if ((int)trimmed.size() < config_.sampleRate / 2) {
+                if ((int)audioData.size() < config_.sampleRate / 2) return false;
+                trimmed = audioData;
+            }
+
+            auto mel = melExtractor_->extract(trimmed);
+            auto emb = computeEmbeddingByChunks(mel);
+            if (emb.empty()) return false;
+
+            l2normalize(emb);
+
+            SpeakerModel m;
+            m.name = name;
+            m.embedding = emb;
+
+            if (!fs::exists(modelDir_)) fs::create_directories(modelDir_);
+            fs::path p = fs::path(modelDir_) / fs::u8path(name + ".bin");
             bool ok = m.saveToFile(p);
             if (ok) {
-                // メモリ上のリストも更新
-                bool found = false;
-                for (auto& s : speakers_) {
-                    if (s.name == name) {
-                        s = m;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) speakers_.push_back(m);
-
+                speakers_.push_back(m);
                 std::cout << "[SpeakerID] Enrolled: " << name
                     << " (embedding size: " << emb.size() << ")" << std::endl;
             }
