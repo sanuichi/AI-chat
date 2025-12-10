@@ -85,107 +85,8 @@ namespace SpeakerID {
         //fftw_init_threads();
         //fftw_plan_with_nthreads(std::thread::hardware_concurrency());
 
+
         Eigen::MatrixXd extract(const std::vector<float>& audio_in) {
-            if (audio_in.empty()) return Eigen::MatrixXd::Zero(nMels_, 1);
-
-            std::vector<float> audio = audio_in;
-
-            // プリエンファシス
-            const float preemphasis = 0.97f;
-            for (int i = (int)audio.size() - 1; i > 0; --i) {
-                audio[i] -= preemphasis * audio[i - 1];
-            }
-
-            // ✅ RMS正規化を削除（話者の声量特徴を保持）
-            // 代わりに、クリッピングのみ実行
-            double max_val = 0.0;
-            for (auto s : audio) {
-                max_val = std::max(max_val, std::abs((double)s));
-            }
-
-            // 音声が大きすぎる場合のみスケーリング（0.95を超えた場合）
-            if (max_val > 0.95) {
-                float scale = 0.95f / max_val;
-                for (auto& s : audio) {
-                    s *= scale;
-                }
-                std::cout << "[Audio] Scaled down by " << scale << " to prevent clipping" << std::endl;
-            }
-
-            // 最終的なクリッピング
-            for (auto& s : audio) {
-                s = std::max(-1.0f, std::min(1.0f, s));
-            }
-
-            if ((int)audio.size() < fftSize_) {
-                audio.resize(fftSize_, 0.0f);
-            }
-
-            int numFrames = static_cast<int>((audio.size() - fftSize_) / hopSize_) + 1;
-            if (numFrames <= 0) numFrames = 1;
-
-            Eigen::MatrixXd melSpec(nMels_, numFrames);
-
-            // STFT + メルフィルタバンク
-            for (int i = 0; i < numFrames; ++i) {
-                int start = i * hopSize_;
-
-                for (int j = 0; j < fftSize_; ++j) {
-                    double v = 0.0;
-                    if (start + j < (int)audio.size()) v = audio[start + j];
-                    fftIn_[j] = v * window_[j];
-                }
-
-                fftw_execute(fftPlan_);
-
-                Eigen::VectorXd power(fftSize_ / 2 + 1);
-                for (int j = 0; j < (fftSize_ / 2 + 1); ++j) {
-                    double re = fftOut_[j][0];
-                    double im = fftOut_[j][1];
-                    power(j) = re * re + im * im;
-                }
-
-                Eigen::VectorXd mel = melFilterbanks_ * power;
-                // dB変換
-                mel = (mel.array() + 1e-10).log10() * 10.0;
-                melSpec.col(i) = mel;
-            }
-
-            // ✅ フレーム単位（時間軸）での正規化に変更（話者の音色特徴を保持）
-            // 各フレームごとに正規化することで、フレーム間の相対的な違い（話者特徴）を保持
-            for (int t = 0; t < melSpec.cols(); ++t) {
-                Eigen::VectorXd col = melSpec.col(t);
-                double mean = col.mean();
-                double variance = (col.array() - mean).square().mean();
-                double std = std::sqrt(variance);
-
-                // 標準偏差が十分に大きい場合のみ正規化
-                if (std > 1e-8) {
-                    melSpec.col(t) = (col.array() - mean) / std;
-                }
-            }
-
-            // デバッグ情報（最初の数回のみ出力）
-            static int extractCount = 0;
-            extractCount++;
-            if (extractCount <= 3) {
-                double mel_mean = melSpec.mean();
-                double mel_std = std::sqrt((melSpec.array() - mel_mean).square().mean());
-                double mel_min = melSpec.minCoeff();
-                double mel_max = melSpec.maxCoeff();
-
-                std::cout << "[MelSpec #" << extractCount << "] "
-                    << "frames=" << melSpec.cols() << " "
-                    << "range=[" << std::fixed << std::setprecision(2)
-                    << mel_min << "," << mel_max << "] "
-                    << "mean=" << mel_mean << " std=" << mel_std << std::endl;
-            }
-
-            return melSpec;
-        }
-
-
-        Eigen::MatrixXd extract2(const std::vector<float>& audio_in) {
             if (audio_in.empty()) return Eigen::MatrixXd::Zero(nMels_, 1);
 
             std::vector<float> audio = audio_in;
@@ -238,8 +139,7 @@ namespace SpeakerID {
                 }
 
                 Eigen::VectorXd mel = melFilterbanks_ * power;
-                //mel = (mel.array() + 1e-10).log();
-				mel = (mel.array() + 1e-10).log10() * 10.0;
+                mel = (mel.array() + 1e-10).log();
                 melSpec.col(i) = mel;
             }
 
@@ -574,89 +474,199 @@ namespace SpeakerID {
             loadSpeakerModels();
         }
 
-        // ================================
-           // ★ 5 回録音して平均化して話者登録する関数
-           //    enrollSpeakerMulti5()
-           // ================================
-        bool enrollSpeakerMulti5(
-            const std::string& speakerName,
-            const std::vector<std::vector<float>>& audioList)
-        {
-            if (audioList.size() != 5) {
-                std::cerr << "[Error] audioList must contain exactly 5 recordings." << std::endl;
-                return false;
+        bool enrollSpeaker(const std::string& name, const std::vector<float>& audioData) {
+            if (name.empty() || audioData.empty()) return false;
+
+            // 音声長チェック
+            double duration = (double)audioData.size() / config_.sampleRate;
+            if (duration < config_.minAudioSeconds) {
+                std::cerr << "[Warning] Audio too short: " << duration
+                    << "s (minimum " << config_.minAudioSeconds << "s)" << std::endl;
             }
 
-            std::vector<std::vector<float>> embeddings;
-            embeddings.reserve(5);
-
-            // 5回分の埋め込みを生成
-            for (int i = 0; i < 5; i++) {
-                const auto& audio = audioList[i];
-                if (audio.empty()) {
-                    std::cerr << "[Error] One of the recordings is empty." << std::endl;
-                    return false;
-                }
-
-                auto mel = melExtractor_->extract(audio);
-                auto emb = computeEmbeddingByChunks(mel);
-
-                if (emb.empty()) {
-                    std::cerr << "[Error] Failed to extract embedding (#" << i << ")." << std::endl;
-                    return false;
-                }
-
-                // 正規化
-                l2normalize(emb);
-                embeddings.push_back(std::move(emb));
+            auto trimmed = trimSilence(audioData);
+            if ((int)trimmed.size() < config_.sampleRate / 2) {
+                if ((int)audioData.size() < config_.sampleRate / 2) return false;
+                trimmed = audioData;
             }
 
-            // ================================
-            // ★ 5つの埋め込みを平均化
-            // ================================
-            std::vector<float> avg(embeddings[0].size(), 0.0f);
+            auto mel = melExtractor_->extract(trimmed);
+            auto emb = computeEmbeddingByChunks(mel);
+            if (emb.empty()) return false;
 
-            for (size_t d = 0; d < avg.size(); d++) {
-                float sum = 0.0f;
-                for (int i = 0; i < 5; i++) sum += embeddings[i][d];
-                avg[d] = sum / 5.0f;
+            l2normalize(emb);
+
+            SpeakerModel m;
+            m.name = name;
+            m.embedding = emb;
+
+            if (!fs::exists(modelDir_)) fs::create_directories(modelDir_);
+            fs::path p = fs::path(modelDir_) / fs::u8path(name + ".bin");
+            bool ok = m.saveToFile(p);
+            if (ok) {
+                speakers_.push_back(m);
+                std::cout << "[SpeakerID] Enrolled: " << name
+                    << " (embedding size: " << emb.size() << ")" << std::endl;
             }
-
-            // 最後にもう一度 L2 正規化
-            l2normalize(avg);
-
-            // ================================
-            // ★ SpeakerModel として保存
-            // ================================
-            SpeakerModel model;
-            model.name = speakerName;
-            model.embedding = avg;
-
-            std::filesystem::path dir = modelDir_;
-            if (!std::filesystem::exists(dir)) std::filesystem::create_directories(dir);
-
-            std::filesystem::path file = dir / std::filesystem::u8path(speakerName + ".bin");
-
-            if (!model.saveToFile(file)) {
-                std::cerr << "[Error] Failed to save averaged speaker model." << std::endl;
-                return false;
-            }
-
-            // メモリ上のリストへ反映
-            bool found = false;
-            for (auto& spk : speakers_) {
-                if (spk.name == speakerName) {
-                    spk = model;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) speakers_.push_back(model);
-
-            std::cout << "[SpeakerID] Enrolled (5‑recording averaged): " << speakerName << std::endl;
-            return true;
+            return ok;
         }
 
+        IdentificationResult identify(const std::vector<float>& audioData) {
+            IdentificationResult result;
+            result.speakerName = "Unknown";
+            result.confidence = -2.0;
+            result.isUnknown = true;
+
+            if (audioData.empty() || speakers_.empty()) return result;
+
+            // 音声長チェック
+            double duration = (double)audioData.size() / config_.sampleRate;
+            if (duration < 0.5) {
+                std::cerr << "[Warning] Audio too short for identification: "
+                    << duration << "s" << std::endl;
+                return result;
+            }
+
+            auto trimmed = trimSilence(audioData);
+            if ((int)trimmed.size() < config_.sampleRate / 2) {
+                if ((int)audioData.size() < config_.sampleRate / 2) return result;
+                trimmed = audioData;
+            }
+
+            auto mel = melExtractor_->extract(trimmed);
+            auto testEmb = computeEmbeddingByChunks(mel);
+            if (testEmb.empty()) return result;
+            l2normalize(testEmb);
+
+            // 埋め込みの品質チェック
+            double embStd = 0.0;
+            double embMean = 0.0;
+            for (auto v : testEmb) embMean += v;
+            embMean /= testEmb.size();
+            for (auto v : testEmb) embStd += (v - embMean) * (v - embMean);
+            embStd = std::sqrt(embStd / testEmb.size());
+
+            std::cout << "[Embedding] size=" << testEmb.size()
+                << " std=" << std::fixed << std::setprecision(4) << embStd << std::endl;
+
+            double maxSim = -2.0;
+            std::string best = "Unknown";
+
+            std::cout << "[Similarity Scores]" << std::endl;
+            for (const auto& s : speakers_) {
+                double sim = StatisticalEmbedding::cosineSimilarity(testEmb, s.embedding);
+                result.allScores.push_back({ s.name, sim });
+                std::cout << "  " << s.name << ": " << std::fixed
+                    << std::setprecision(4) << sim << std::endl;
+                if (sim > maxSim) { maxSim = sim; best = s.name; }
+            }
+
+            std::sort(result.allScores.begin(), result.allScores.end(),
+                [](auto& a, auto& b) { return a.second > b.second; });
+
+            result.confidence = maxSim;
+            result.speakerName = best;
+            result.isUnknown = (maxSim < config_.minConfidence);
+            if (result.isUnknown) result.speakerName = "Unknown";
+
+            return result;
+        }
+
+        std::vector<std::string> getSpeakerNames() const {
+            std::vector<std::string> names;
+            names.reserve(speakers_.size());
+            for (auto& s : speakers_) names.push_back(s.name);
+            return names;
+        }
+
+        size_t getSpeakerCount() const { return speakers_.size(); }
+
+        bool removeSpeaker(const std::string& name) {
+            auto it = std::find_if(speakers_.begin(), speakers_.end(),
+                [&](const SpeakerModel& m) { return m.name == name; });
+            if (it == speakers_.end()) return false;
+            fs::path p = fs::path(modelDir_) / fs::u8path(name + ".bin");
+            try {
+                if (fs::exists(p)) fs::remove(p);
+            }
+                    std::cout << "[ONNX #" << callCount << "] Output: size=" << size
+                        << " range=[" << std::fixed << std::setprecision(3)
+                        << embMin << "," << embMax << "] mean=" << embMean << std::endl;
+                }
+
+                return embedding;
+
+            }
+            catch (const Ort::Exception& e) {
+                std::cerr << "[ONNX Error] " << e.what() << std::endl;
+                return {};
+            }
+        }
+
+    private:
+        std::unique_ptr<Ort::Env> env_;
+        std::unique_ptr<Ort::Session> session_;
+        std::string inputName_;
+        std::string outputName_;
+        std::vector<int64_t> inputShape_;
+        bool initialized_;
+    };
+
+    // ==================== SpeakerModel ====================
+    struct SpeakerModel {
+        std::string name;
+        std::vector<float> embedding;
+
+        bool saveToFile(const fs::path& filename) const {
+            std::ofstream ofs(filename, std::ios::binary);
+            if (!ofs) return false;
+            uint32_t nameLen = static_cast<uint32_t>(name.size());
+            ofs.write(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
+            ofs.write(name.data(), nameLen);
+            uint32_t embSize = static_cast<uint32_t>(embedding.size());
+            ofs.write(reinterpret_cast<const char*>(&embSize), sizeof(embSize));
+            ofs.write(reinterpret_cast<const char*>(embedding.data()), embSize * sizeof(float));
+            return ofs.good();
+        }
+
+        bool loadFromFile(const fs::path& filename) {
+            std::ifstream ifs(filename, std::ios::binary);
+            if (!ifs) return false;
+            uint32_t nameLen = 0;
+            ifs.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+            name.resize(nameLen);
+            ifs.read(&name[0], nameLen);
+            uint32_t embSize = 0;
+            ifs.read(reinterpret_cast<char*>(&embSize), sizeof(embSize));
+            embedding.resize(embSize);
+            ifs.read(reinterpret_cast<char*>(embedding.data()), embSize * sizeof(float));
+            return ifs.good();
+        }
+    };
+
+    // ==================== SpeakerIdentifier (改善版) ====================
+    class SpeakerIdentifier {
+    public:
+        SpeakerIdentifier(const std::string& modelDir,
+            const std::string& onnxModelPath = "",
+            const Config& config = Config())
+            : modelDir_(modelDir), config_(config)
+        {
+            melExtractor_ = std::make_unique<MelSpectrogramExtractor>(config_);
+
+            if (!onnxModelPath.empty()) {
+                onnxModel_ = std::make_unique<ONNXEmbedding>(onnxModelPath, config_);
+                useONNX_ = onnxModel_->isInitialized();
+                if (useONNX_) {
+                    std::cout << "[SpeakerID] Using ONNX embeddings." << std::endl;
+                }
+                else {
+                    std::cerr << "[SpeakerID] ONNX failed; using statistical embeddings." << std::endl;
+                }
+            }
+
+            loadSpeakerModels();
+        }
 
         bool enrollSpeaker(const std::string& name, const std::vector<float>& audioData) {
             if (name.empty() || audioData.empty()) return false;
@@ -680,40 +690,15 @@ namespace SpeakerID {
 
             l2normalize(emb);
 
-            // ✅ 既存の話者モデルがあれば統合（Centroid Update）
             SpeakerModel m;
             m.name = name;
             m.embedding = emb;
 
             if (!fs::exists(modelDir_)) fs::create_directories(modelDir_);
             fs::path p = fs::path(modelDir_) / fs::u8path(name + ".bin");
-
-            if (fs::exists(p)) {
-                SpeakerModel existing;
-                if (existing.loadFromFile(p)) {
-                    if (existing.embedding.size() == emb.size()) {
-                        std::cout << "[SpeakerID] Updating existing model for: " << name << std::endl;
-                        for (size_t i = 0; i < emb.size(); ++i) {
-                            m.embedding[i] += existing.embedding[i];
-                        }
-                        l2normalize(m.embedding);
-                    }
-                }
-            }
-
             bool ok = m.saveToFile(p);
             if (ok) {
-                // メモリ上のリストも更新
-                bool found = false;
-                for (auto& s : speakers_) {
-                    if (s.name == name) {
-                        s = m;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) speakers_.push_back(m);
-
+                speakers_.push_back(m);
                 std::cout << "[SpeakerID] Enrolled: " << name
                     << " (embedding size: " << emb.size() << ")" << std::endl;
             }
@@ -727,14 +712,6 @@ namespace SpeakerID {
             result.isUnknown = true;
 
             if (audioData.empty() || speakers_.empty()) return result;
-
-            // ✅ 音声品質チェックを追加
-            //if (!isValidSpeech(audioData)) {
-              //  std::cout << "[Warning] Input does not appear to be human speech" << std::endl;
-              //  result.speakerName = "Not Speech";
-              //  result.isUnknown = true;
-              //  return result;
-            //}
 
             // 音声長チェック
             double duration = (double)audioData.size() / config_.sampleRate;
@@ -811,90 +788,13 @@ namespace SpeakerID {
             return true;
         }
 
-    public:
+    private:
         std::string modelDir_;
         Config config_;
         std::unique_ptr<MelSpectrogramExtractor> melExtractor_;
         std::unique_ptr<ONNXEmbedding> onnxModel_;
         bool useONNX_ = false;
         std::vector<SpeakerModel> speakers_;
-
-        // 音声が人間の発話かどうかを判定
-        bool isValidSpeech(const std::vector<float>& audio) const {
-            if (audio.empty()) return false;
-
-            // 1. RMSチェック（音量）
-            double rms = 0.0;
-            for (auto s : audio) rms += s * s;
-            rms = std::sqrt(rms / audio.size());
-
-            if (rms < 0.005 || rms > 0.5) {
-                std::cout << "[Quality] RMS out of range: " << rms << std::endl;
-                return false;
-            }
-
-            // 2. ZCR（ゼロクロスレート）チェック
-            double zcr = calculateZCR(audio.data(), audio.size());
-
-            // 人間の音声: 0.05 ~ 0.4 程度
-            // 雑音（足音、ドア）: 0.01未満 or 0.6以上
-            if (zcr < 0.03 || zcr > 0.5) {
-                std::cout << "[Quality] ZCR out of range: " << zcr << std::endl;
-                return false;
-            }
-
-            // 3. スペクトル集中度チェック
-            auto mel = melExtractor_->extract(audio);
-
-            // 各フレームのエネルギー分散を計算
-            double totalEnergy = 0.0;
-            int validFrames = 0;
-
-            for (int t = 0; t < mel.cols(); ++t) {
-                double frameEnergy = 0.0;
-                for (int f = 0; f < mel.rows(); ++f) {
-                    frameEnergy += std::abs(mel(f, t));
-                }
-                if (frameEnergy > 0.1) {  // 有意なフレームのみ
-                    totalEnergy += frameEnergy;
-                    validFrames++;
-                }
-            }
-
-            if (validFrames < mel.cols() * 0.3) {  // 有効フレームが30%未満
-                std::cout << "[Quality] Too few valid frames: "
-                    << validFrames << "/" << mel.cols() << std::endl;
-                return false;
-            }
-
-            // 4. 周波数帯域のエネルギー分布チェック
-            // 人間の音声は特定の帯域（300Hz-3400Hz）にエネルギーが集中
-            Eigen::VectorXd freqEnergy = mel.rowwise().mean();
-
-            // 低周波帯（0-5）、中周波帯（5-40）、高周波帯（40-80）
-            double lowEnergy = freqEnergy.segment(0, 5).sum();
-            double midEnergy = freqEnergy.segment(5, 35).sum();
-            double highEnergy = freqEnergy.segment(40, 40).sum();
-
-            double totalFreqEnergy = lowEnergy + midEnergy + highEnergy;
-            if (totalFreqEnergy < 1e-8) return false;
-
-            double midRatio = midEnergy / totalFreqEnergy;
-
-            // 人間の音声は中周波帯に60%以上のエネルギー
-            if (midRatio < 0.5) {
-                std::cout << "[Quality] Mid-frequency ratio too low: "
-                    << midRatio << std::endl;
-                return false;
-            }
-
-            std::cout << "[Quality] Valid speech detected "
-                << "(RMS=" << rms << ", ZCR=" << zcr
-                << ", MidRatio=" << midRatio << ")" << std::endl;
-
-            return true;
-        }
-
 
         static void l2normalize(std::vector<float>& v) {
             double s = 0.0;
@@ -1066,13 +966,4 @@ namespace SpeakerID {
         }
     };
 
-
-#include "SpeakerIdentifier.h"
-    using namespace SpeakerID;
-
-   
-
 } // namespace SpeakerID
-
-
-

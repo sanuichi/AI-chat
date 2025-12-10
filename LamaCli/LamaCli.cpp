@@ -261,6 +261,107 @@ std::string ReadUTF8Input2() {
     return line;
 }
 
+
+double voice_band_ratio(const float* data, size_t n, int sample_rate = 16000) {
+    // FFTサイズ
+    size_t N = n;
+
+    std::vector<double> in(N);
+    std::vector<fftw_complex> out(N / 2 + 1);
+
+    for (size_t i = 0; i < N; i++) in[i] = data[i];
+
+    fftw_plan p = fftw_plan_dft_r2c_1d((int)N, in.data(), out.data(), FFTW_ESTIMATE);
+    fftw_execute(p);
+    fftw_destroy_plan(p);
+
+    double voice_energy = 0.0;
+    double total_energy = 0.0;
+
+    double bin_hz = (double)sample_rate / (double)N;
+
+    for (size_t i = 0; i < N / 2 + 1; i++) {
+        double mag = out[i][0] * out[i][0] + out[i][1] * out[i][1];
+        double freq = i * bin_hz;
+
+        if (freq >= 300 && freq <= 3000) {
+            voice_energy += mag;
+        }
+        total_energy += mag;
+    }
+
+    if (total_energy == 0.0) return 0.0;
+    return voice_energy / total_energy;
+}
+double rms(const float* data, size_t n) {
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += double(data[i]) * double(data[i]);
+    return n ? std::sqrt(s / n) : 0.0;
+}
+
+double zcr(const float* data, size_t n) {
+    int zero_crossings = 0;
+    for (size_t i = 1; i < n; ++i) {
+        if ((data[i - 1] >= 0 && data[i] < 0) ||
+            (data[i - 1] < 0 && data[i] >= 0)) {
+            zero_crossings++;
+        }
+    }
+    return n ? double(zero_crossings) / double(n) : 0.0;
+}
+
+class PulledVAD {
+public:
+    PulledVAD(int sr = 16000)
+        : sample_rate(sr), pull_score(0.0), release_score(0.0) {
+    }
+
+    bool process(const float* data, size_t n, double adaptive_threshold, double& rmsdata) {
+        double r = rms(data, n);
+        double z = zcr(data, n);
+        double v = voice_band_ratio(data, n, sample_rate);
+
+		rmsdata = r;
+
+
+        // 重み付きスコア
+        double score = 0.0;
+        score += (r > adaptive_threshold) ? 0.4 : 0.0;
+        score += (z > 0.05 && z < 0.6) ? 0.2 : 0.0;
+        score += (v > 0.60) ? 0.4 : 0.0;
+
+        // === Pull / Release ===
+        if (score > 0.6) {
+            pull_score += 1.0;
+            release_score = 0.0;
+        }
+        else {
+            release_score += 1.0;
+            pull_score *= 0.7;
+        }
+
+        // 移動平均的な安定化
+        pull_score = std::min(pull_score, 10.0);
+
+        // ON/OFF 判定
+        if (pull_score > 3.0) {
+            is_active = true;
+        }
+
+        if (release_score > 5.0) {
+            is_active = false;
+        }
+
+        return is_active;
+    }
+
+private:
+    int sample_rate;
+    double pull_score;
+    double release_score;
+    bool is_active = false;
+};
+
 class MicrophoneRecorder {
 public:
     MicrophoneRecorder(int sampleRate = 16000, int channels = 1)
@@ -385,6 +486,13 @@ public:
             return false;
         }
         return identifier_.enrollSpeaker(speakerName, audio);
+    }
+    bool enrollSpeakerMulti5(const std::string& speakerName, const std::vector<std::vector<float>>& audioList){
+        if (audioList.size() != 5) {
+            std::cerr << "Audio data size error" << std::endl;
+            return false;
+        }
+        return identifier_.enrollSpeakerMulti5(speakerName, audioList);
     }
 
     bool enrollSpeakerFromMic(const std::string& speakerName, double durationSec = 3.0) {
@@ -525,22 +633,6 @@ private:
     Config config_;
 };
 
-double rms(const float* data, size_t n) {
-    double s = 0.0;
-    for (size_t i = 0; i < n; ++i) s += double(data[i]) * double(data[i]);
-    return n ? std::sqrt(s / n) : 0.0;
-}
-
-double zcr(const float* data, size_t n) {
-    int zero_crossings = 0;
-    for (size_t i = 1; i < n; ++i) {
-        if ((data[i - 1] >= 0 && data[i] < 0) ||
-            (data[i - 1] < 0 && data[i] >= 0)) {
-            zero_crossings++;
-        }
-    }
-    return n ? double(zero_crossings) / double(n) : 0.0;
-}
 
 double update_adaptive_rms_threshold2(double current_rms,
     std::vector<double>& recent_rms,
@@ -557,8 +649,25 @@ double update_adaptive_rms_threshold2(double current_rms,
     return avg * scale;
 }
 
-// ZCR範囲の調整
 bool is_speech(const float* data, size_t n, double rms_threshold) {
+    double r = rms(data, n);
+    double z = zcr(data, n);
+    double v = voice_band_ratio(data, n);
+
+    const double ZCR_MIN = 0.05;
+    const double ZCR_MAX = 0.6;
+
+    const double VOICE_RATIO_MIN = 0.60;  // 60%以上が音声帯域ならOK
+
+    bool rms_ok = r > rms_threshold;
+    bool zcr_ok = z > ZCR_MIN && z < ZCR_MAX;
+    bool voice_ok = v > VOICE_RATIO_MIN;
+
+    return rms_ok && zcr_ok && voice_ok;
+}
+
+// ZCR範囲の調整
+bool is_speech1(const float* data, size_t n, double rms_threshold) {
     double r = rms(data, n);
     double z = zcr(data, n);
 
@@ -598,7 +707,7 @@ double update_adaptive_rms_threshold(double current_rms,
     }
 
     // 最小しきい値を設定
-    const double MIN_THRESHOLD = 0.02; // 0.015 → 0.02 に引き上げ（最小音量底上げ）
+    const double MIN_THRESHOLD = 0.015; // 0.015 → 0.02 に引き上げ（最小音量底上げ）
     return std::max(MIN_THRESHOLD, median * scale);
 }
 
@@ -772,6 +881,356 @@ void Enrollment_thread()
 
     // ハイパスフィルターの初期化 (150Hz)
     HighPassFilter hpf(150.0f, 16000.0f);
+
+    // ローパスフィルターの初期化 (4000Hz)
+    LowPassFilter lpf(4000.0f, 16000.0f);
+
+    // VOICEVOXか手動で音声を入力するか？
+    WriteUTF8("VOICEVOXを使いますか  0:使わない 1:使います");
+
+    std::string character = ReadUTF8Input();
+
+    int chara = std::stoi(character);
+
+
+    // 話者識別登録データ5回に平均値を使う
+    int REPCNT = 5;
+
+    // VPICEVOXで喋る文章
+    std::vector<std::string> speaklist;
+
+    if (chara == 1) {
+
+        // 文章登録 5文章 
+        for (int i = 0; i < REPCNT; ) {
+
+            std::string s = std::to_string(i);
+
+            s += ": しゃべる文章を入力: ";
+            WriteUTF8(s);
+
+            std::string speakString = ReadUTF8Input();
+
+            if (speakString.empty()) {
+                continue;
+            }
+            speaklist.push_back(speakString);
+
+            i++;
+        }
+
+        if (speaklist.size() != REPCNT) {
+
+            WriteUTF8("登録データ数が違います");
+        }
+
+    }
+
+    bool recording_started = false;
+    int pre_speech_silence = 0;
+
+    while (!stop_flag) {
+
+        std::vector<std::vector<float>> audioList;
+
+        WriteUTF8("\n--- 新しい話者を登録 ---\n");
+        WriteUTF8("話者名を入力 (終了: 'quit'): ");
+
+        std::string speakerName = ReadUTF8Input();
+
+        if (speakerName == "quit" || speakerName == "q") {
+            break;
+        }
+        
+        if (speakerName.empty()) {
+            WriteUTF8("? 話者名を入力してください\n");
+            continue;
+        }
+
+        if (chara == 1) {
+
+            WriteUTF8("四国めたん\tあまあま\t0\n");
+            WriteUTF8("ずんだもん\tノーマル\t3\n");
+            WriteUTF8("春日部つむぎ\tノーマル\t8\n");
+            WriteUTF8("九州そら\tノーマル\t16\n");
+            WriteUTF8("もち子さん\tノーマル\t20\n");
+            WriteUTF8("\nキャラクターNoを入力: ");
+
+            std::string speakID = ReadUTF8Input();
+
+            if (speakID.empty()) {
+                WriteUTF8("? キャラクターNoを入力してください\n");
+                continue;
+            }
+
+            g_voice.style_id = std::stoi(speakID);
+        }
+
+		audioList.clear();
+
+        for (int i = 0; i < REPCNT; i++ ) {
+
+            // 状態をリセット
+			silence_count = 0;              // 無音カウント
+			active_count = 0;               // 音声カウント
+			recording_started = false;      // 録音開始フラグ
+            pre_speech_silence = 0;         // 録音開始前の連続無音カウント
+			accumulated_chunk.clear();      // 録音データ蓄積バッファ
+			recent_rms.clear();            // RMS履歴クリア  　
+            double adaptive_threshold = 0.02;  // ← ここで定義（初期値を設定）
+            std::string numstr;
+
+            WriteUTF8("\n============================================================================\n");
+            numstr = std::to_string(i);
+            std::string s = numstr + "\n";
+            WriteUTF8(s);
+
+            std::cout << speaklist.at(i) << std::endl;
+
+            WriteUTF8("ENTERで開始します\n");
+
+            // 音声キューとバッファをクリア
+            {
+                std::lock_guard<std::mutex> lk(qmutex);
+                while (!audio_queue.empty()) {
+                    audio_queue.pop();
+                }
+            }
+
+            //ここで環境音をためてください
+            ReadUTF8Input();
+
+            // 音声キューとバッファをクリアとスレッシュ計算
+            {
+                std::lock_guard<std::mutex> lk(qmutex);
+
+                // ★ キューにあるデータで環境ノイズを測定
+                std::vector<double> noise_samples;
+                while (!audio_queue.empty()) {
+                    auto& noise_chunk = audio_queue.front();
+
+                    if (!noise_chunk.empty()) {
+                        // ハイパス・ローパスフィルター適用
+                        hpf.process(noise_chunk);
+                        lpf.process(noise_chunk);
+
+                        // RMS計算
+                        double noise_rms = rms(noise_chunk.data(), noise_chunk.size());
+                        noise_samples.push_back(noise_rms);
+                    }
+
+                    audio_queue.pop();
+                }
+
+                // ★ ノイズサンプルから初期閾値を計算
+                if (!noise_samples.empty()) {
+                    // recent_rmsにノイズデータを設定
+                    recent_rms = noise_samples;
+
+                    // 初期閾値を計算
+                    adaptive_threshold = update_adaptive_rms_threshold(
+                        noise_samples.back(),
+                        recent_rms,
+                        20,
+                        2.0  // multiplierは2.0程度が良い
+                    );
+
+                    std::cout << "環境ノイズ測定完了: " << noise_samples.size()
+                        << " サンプル, 初期閾値=" << std::fixed
+                        << std::setprecision(4) << adaptive_threshold << std::endl;
+                }
+                else {
+                    // データがない場合はデフォルト値
+                    adaptive_threshold = 0.02;
+                    recent_rms.clear();
+                }
+            }
+
+            if (chara == 1) {
+
+				// VOICEVOXで喋らせる
+
+                std::string s = speaklist[i];
+
+
+                if (!s.empty()) {
+
+                    WriteUTF8("\n音声を再生します...\n");
+                    g_voice.VoicePlay(s);
+
+                    // 音声再生開始を待つ
+                    Sleep(500);
+                }
+            }
+            else {
+
+                // 自分で音声を入力する
+                WriteUTF8("\n音声を待機中...(話し始めると自動で録音開始します)\n");
+                WriteUTF8("マイクに向かって喋ってください");
+            }
+
+            // 録音用の無音判定閾値
+            // ※ 0.5秒 × 4 = 2.0秒の無音で録音終了
+            // ※ 文中の短い間（Silence=1?2）は継続、文末の長い無音で終了
+            const int RECORDING_SILENCE_LIMIT = 4;
+
+            while (!stop_flag) {
+
+				// 音声データが入力されるまで待機
+                std::unique_lock<std::mutex> lk(qmutex);
+                qcv.wait(lk, [] { return !audio_queue.empty() || stop_flag.load(); });
+                
+                if (stop_flag && audio_queue.empty()) break;
+
+                auto chunk = std::move(audio_queue.front());
+                audio_queue.pop();
+                lk.unlock();
+
+                if (chunk.empty()) continue;
+
+                // ハイパスフィルター適用 (足音対策)
+                hpf.process(chunk);
+
+                // ローパスフィルター適用 (拍手・食器音対策)
+                lpf.process(chunk);
+
+
+
+                double current_rms = rms(chunk.data(), chunk.size());
+
+
+                // 先に閾値を計算（前回までのノイズレベルで）
+                double speech_threshold = recording_started ? adaptive_threshold * 0.7 : adaptive_threshold;
+                bool speech = is_speech(chunk.data(), chunk.size(), speech_threshold);
+
+                // 無音の場合のみ閾値を更新
+                if (!speech) {
+
+                    adaptive_threshold = update_adaptive_rms_threshold(current_rms, recent_rms, 20, 2.5);
+                }
+
+                
+                // 音声検出時の処理
+                if (speech) {
+                    if (!recording_started) {
+                        recording_started = true;
+                        pre_speech_silence = 0;
+                        WriteUTF8(" 録音開始！\n");
+                    }
+                    silence_count = 0;
+                    active_count++;
+                }
+                else {
+                    // 無音検出
+                    if (recording_started && active_count > 0) {
+                        // 録音開始後の無音をカウント
+                        silence_count++;
+                    }
+                    else if (!recording_started) {
+                        // 録音開始前の無音カウント（タイムアウト用）
+                        pre_speech_silence++;
+                    }
+                }
+
+                // 録音開始後のみデータを蓄積
+                if (recording_started) {
+                    accumulated_chunk.insert(accumulated_chunk.end(), chunk.begin(), chunk.end());
+                }
+
+                // タイムアウトチェック（30秒音声なし）
+                if (!recording_started && pre_speech_silence > 60) {  // 0.5秒 × 60 = 30秒
+                    WriteUTF8("?					 タイムアウト: 音声が検出されませんでした\n");
+                    break;
+                }
+
+                //if (recording_started) {
+                    std::cout << "RMS=" << std::fixed << std::setprecision(4) << current_rms
+                        << "  Threshold=" << speech_threshold
+                        << "  Speech=" << speech
+                        << "  Active=" << active_count
+                        << "  Silence=" << silence_count
+                        << "  Duration=" << std::setprecision(1)
+                        << (accumulated_chunk.size() / (float)TARGET_RATE) << "s"
+                        << std::endl;
+                //}
+
+                // 音声終了判定（無音が3秒続いたら終了）
+                const int RECORDING_SILENCE_LIMIT = 6;  // 0.5秒 × 6 = 3秒
+                if (silence_count >= RECORDING_SILENCE_LIMIT && active_count > 0 && recording_started) {
+                    WriteUTF8("\n 録音終了（無音検出）\n");
+
+                    if (accumulated_chunk.size() >= TARGET_RATE * 0.5) {
+
+                        // 末尾の無音を削除（2.5秒分 = RECORDING_SILENCE_LIMIT - 1チャンク分の余裕）
+                        int silence_samples = static_cast<int>(TARGET_RATE * 3); // 2.5秒
+                        int trim_size = std::min(silence_samples, static_cast<int>(accumulated_chunk.size()) - TARGET_RATE / 2);
+
+                        if (trim_size > 0) {
+                            accumulated_chunk.resize(accumulated_chunk.size() - trim_size);
+                            std::cout << "末尾の無音を削除: " << (trim_size / (float)TARGET_RATE)
+                                << "秒 (残り: " << (accumulated_chunk.size() / (float)TARGET_RATE) << "秒)" << std::endl;
+                        }
+
+                        // UTF-8 → Shift-JIS変換してファイル名作成
+                        std::string filename_utf8 = speakerName + numstr + ".wav";
+                        std::string filename_sjis = utf8_to_sjis(filename_utf8);
+
+                        // Shift-JISのファイル名でWAVファイル保存
+                        bool saveResult = SaveWavFile2(filename_sjis.c_str(), accumulated_chunk);
+
+                        if (saveResult) {
+                            WriteUTF8("? 音声ファイル保存成功\n");
+
+                            // 話者登録（UTF-8の名前を使用）
+                            WriteUTF8("話者登録中...\n");
+                            //bool enrollResult = system.enrollSpeaker(speakerName, accumulated_chunk);
+
+                            audioList.push_back(accumulated_chunk);
+                        }
+                        else {
+                            WriteUTF8("? 音声ファイル保存失敗\n");
+                        }
+                    }
+                    else {
+                        WriteUTF8("?					 音声が短すぎます（最低0.5秒必要）\n");
+                    }
+
+                    // 次の登録に備えてリセット
+                    accumulated_chunk.clear();
+                    silence_count = 0;
+                    active_count = 0;
+                    break;
+                }
+            }
+        }
+
+        // データ登録                
+        bool enrollResult = system.enrollSpeakerMulti5(speakerName, audioList);
+
+
+    }
+}
+
+void Enrollment_thread2()
+{
+    int silence_count = 0;
+    int active_count = 0;
+    std::vector<float> accumulated_chunk;
+    std::vector<double> recent_rms;
+
+    Config config;
+    config.sampleRate = 16000;
+    config.nMels = 80;
+    config.cudaDeviceId = 0;
+    config.useFP16 = false;
+    config.useCPUFallback = true;
+    config.minConfidence = 0.55;
+
+    std::string onnxModelPath = "speaker_resnet.onnx";
+    SpeakerSelectSystem system("speaker_models", onnxModelPath, config);
+
+    // ハイパスフィルターの初期化 (150Hz)
+    HighPassFilter hpf(150.0f, 16000.0f);
     // ローパスフィルターの初期化 (4000Hz)
     LowPassFilter lpf(4000.0f, 16000.0f);
 
@@ -804,6 +1263,16 @@ void Enrollment_thread()
 
         if (chara == 1) {
 
+            std::string speakID = ReadUTF8Input();
+
+            if (speakID.empty()) {
+                WriteUTF8("⚠ キャラクターNoを入力してください\n");
+                continue;
+            }
+
+            g_voice.style_id = std::stoi(speakID);
+
+
             WriteUTF8("しゃべる文章を入力: ");
             std::string speakString = ReadUTF8Input();
 
@@ -819,14 +1288,6 @@ void Enrollment_thread()
             WriteUTF8("もち子さん\tノーマル\t20\n");
             WriteUTF8("\nキャラクターNoを入力: ");
 
-            std::string speakID = ReadUTF8Input();
-
-            if (speakID.empty()) {
-                WriteUTF8("⚠ キャラクターNoを入力してください\n");
-                continue;
-            }
-
-            g_voice.style_id = std::stoi(speakID);
 
             // 音声キューとバッファをクリア
             {
@@ -1044,6 +1505,7 @@ void worker_thread_func() {
     int silence_count = 0;
     int active_count = 0;
     std::vector<float> accumulated_chunk;
+    std::vector<float> prev_chunk;
     std::vector<double> recent_rms;
 
     Config config;
@@ -1063,6 +1525,8 @@ void worker_thread_func() {
     LowPassFilter lpf(4000.0f, 16000.0f);
 
     system.printSystemInfo();
+
+    static PulledVAD vad(16000);
 
     int spekercount;
     if ((spekercount = system.getSpeakerCount()) == 0) {
@@ -1090,6 +1554,11 @@ void worker_thread_func() {
     }
     lk.unlock();
 
+
+    double current_rms = 0;
+    double adaptive_threshold = 0.02;
+	double speech_threshold = adaptive_threshold;
+
     while (!stop_flag) {
 
         // 音声データ
@@ -1108,24 +1577,33 @@ void worker_thread_func() {
         // ローパスフィルター適用 (拍手・食器音対策)
         lpf.process(chunk);
 
-
-        double current_rms = rms(chunk.data(), chunk.size());
-        double adaptive_threshold = update_adaptive_rms_threshold(current_rms, recent_rms, 30, 2.5); // 1.5 -> 2.5, 20 -> 30 (登録モードと統一)
+        current_rms = rms(chunk.data(), chunk.size());
+        adaptive_threshold = update_adaptive_rms_threshold(current_rms, recent_rms, 20, 2.5);
 
         // 録音中は閾値を下げる（文末の小さい音も拾う）
-        double speech_threshold = recording_started ? adaptive_threshold * 0.7 : adaptive_threshold;
+        //double speech_threshold = recording_started ? adaptive_threshold * 0.7 : adaptive_threshold;
 
         bool speech = is_speech(chunk.data(), chunk.size(), speech_threshold);
+        //bool speech = vad.process(chunk.data(), chunk.size(), speech_threshold, current_rms);
 
         // 音声検出時の処理
         if (speech) {
             if (!recording_started) {
                 recording_started = true;
                 pre_speech_silence = 0;
+                if (!prev_chunk.empty()) {
+                    // 前回の無音チャンクの後半半分だけを追加
+                    size_t offset = prev_chunk.size() / 2;
+                    accumulated_chunk.insert(accumulated_chunk.end(), prev_chunk.begin() + offset, prev_chunk.end());
+                }
                 WriteUTF8("🎤 録音開始！\n");
+
+                // 録音中は閾値を下げる（文末の小さい音も拾う）
+                speech_threshold = recording_started ? adaptive_threshold * 0.7 : adaptive_threshold;
             }
             silence_count = 0;
             active_count++;
+
         }
         else {
             // 無音検出
@@ -1136,6 +1614,10 @@ void worker_thread_func() {
             else if (!recording_started) {
                 // 録音開始前の無音カウント（タイムアウト用）
                 pre_speech_silence++;
+                prev_chunk = chunk;
+
+                // 無音時じのデータデータで計算
+                adaptive_threshold = update_adaptive_rms_threshold(current_rms, recent_rms, 30, 2.5); // 1.5 -> 2.5, 20 -> 30 (登録モードと統一)
             }
         }
 
@@ -1172,12 +1654,12 @@ void worker_thread_func() {
 
 
                 if (to_process.size() >= TARGET_RATE * 0.5) {
-                  //  to_process = trimTrailingSilence(
-                  //      to_process,
-                  //      TARGET_RATE,
-                  //      SILENCE_LIMIT * 0.5,  // 1秒
-                  //      0.2  // 0.2秒残す（Whisper用）
-                  //  );
+                    to_process = trimTrailingSilence(
+                        to_process,
+                        TARGET_RATE,
+                        SILENCE_LIMIT * 0.5,  // 1秒
+                        0.2  // 0.2秒残す（Whisper用）
+                    );
 
                     ///////////////////////////////////////////////////////////
                     // UTF-8 → Shift-JIS変換してファイル名作成
@@ -1403,6 +1885,90 @@ static void sigint_handler(int signo) {
     }
 }
 #endif
+
+// ================================
+   // ★ 5 回録音して平均化して話者登録する関数
+   //    enrollSpeakerMulti5()
+   // ================================
+bool enrollSpeakerMulti5(SpeakerIdentifier& identifier,
+    const std::string& speakerName,
+    const std::vector<std::vector<float>>& audioList)
+{
+    if (audioList.size() != 5) {
+        std::cerr << "[Error] audioList must contain exactly 5 recordings." << std::endl;
+        return false;
+    }
+
+    std::vector<std::vector<float>> embeddings;
+    embeddings.reserve(5);
+
+    // 5回分の埋め込みを生成
+    for (int i = 0; i < 5; i++) {
+        const auto& audio = audioList[i];
+        if (audio.empty()) {
+            std::cerr << "[Error] One of the recordings is empty." << std::endl;
+            return false;
+        }
+
+        auto mel = identifier.melExtractor_->extract(audio);
+        auto emb = identifier.computeEmbeddingByChunks(mel);
+
+        if (emb.empty()) {
+            std::cerr << "[Error] Failed to extract embedding (#" << i << ")." << std::endl;
+            return false;
+        }
+
+        // 正規化
+        identifier.l2normalize(emb);
+        embeddings.push_back(std::move(emb));
+    }
+
+    // ================================
+    // ★ 5つの埋め込みを平均化
+    // ================================
+    std::vector<float> avg(embeddings[0].size(), 0.0f);
+
+    for (size_t d = 0; d < avg.size(); d++) {
+        float sum = 0.0f;
+        for (int i = 0; i < 5; i++) sum += embeddings[i][d];
+        avg[d] = sum / 5.0f;
+    }
+
+    // 最後にもう一度 L2 正規化
+    identifier.l2normalize(avg);
+
+    // ================================
+    // ★ SpeakerModel として保存
+    // ================================
+    SpeakerModel model;
+    model.name = speakerName;
+    model.embedding = avg;
+
+    std::filesystem::path dir = identifier.modelDir_;
+    if (!std::filesystem::exists(dir)) std::filesystem::create_directories(dir);
+
+    std::filesystem::path file = dir / std::filesystem::u8path(speakerName + ".bin");
+
+    if (!model.saveToFile(file)) {
+        std::cerr << "[Error] Failed to save averaged speaker model." << std::endl;
+        return false;
+    }
+
+    // メモリ上のリストへ反映
+    bool found = false;
+    for (auto& spk : identifier.speakers_) {
+        if (spk.name == speakerName) {
+            spk = model;
+            found = true;
+            break;
+        }
+    }
+    if (!found) identifier.speakers_.push_back(model);
+
+    std::cout << "[SpeakerID] Enrolled (5‑recording averaged): " << speakerName << std::endl;
+    return true;
+}
+
 
 int main(int argc, char** argv) {
 
