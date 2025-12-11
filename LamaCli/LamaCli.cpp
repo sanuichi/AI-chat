@@ -310,6 +310,533 @@ double zcr(const float* data, size_t n) {
     return n ? double(zero_crossings) / double(n) : 0.0;
 }
 
+// ============================================
+// 軽量版VAD実装（改善版）
+// ============================================
+
+class LightweightVAD {
+private:
+    int sample_rate;
+    double pull_score;
+    double release_score;
+    bool is_active;
+
+    // 統計情報収集用
+    struct Statistics {
+        double rms_min = 999.0;
+        double rms_max = 0.0;
+        double zcr_min = 999.0;
+        double zcr_max = 0.0;
+        double sf_min = 999.0;
+        double sf_max = 0.0;
+        int total_frames = 0;
+        int detected_frames = 0;
+    };
+    Statistics stats;
+
+public:
+    LightweightVAD(int sr = 16000)
+        : sample_rate(sr), pull_score(0.0), release_score(0.0), is_active(false) {
+    }
+
+    // RMS計算
+    double rms(const float* data, size_t n) {
+        double s = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            s += double(data[i]) * double(data[i]);
+        }
+        return n ? std::sqrt(s / n) : 0.0;
+    }
+
+    // ZCR計算
+    double zcr(const float* data, size_t n) {
+        int zero_crossings = 0;
+        for (size_t i = 1; i < n; ++i) {
+            if ((data[i - 1] >= 0 && data[i] < 0) ||
+                (data[i - 1] < 0 && data[i] >= 0)) {
+                zero_crossings++;
+            }
+        }
+        return n ? double(zero_crossings) / double(n) : 0.0;
+    }
+
+    // スペクトル平坦度計算
+    double spectral_flatness(const float* data, size_t n) {
+        size_t N = n;
+        std::vector<double> in(N);
+        std::vector<fftw_complex> out(N / 2 + 1);
+
+        for (size_t i = 0; i < N; i++) {
+            in[i] = data[i];
+        }
+
+        fftw_plan p = fftw_plan_dft_r2c_1d((int)N, in.data(), out.data(), FFTW_ESTIMATE);
+        fftw_execute(p);
+        fftw_destroy_plan(p);
+
+        double geometric_mean_log = 0.0;
+        double arithmetic_mean = 0.0;
+        int count = 0;
+
+        // 100Hz - 4000Hz の範囲のみ使用
+        double bin_hz = (double)sample_rate / (double)N;
+
+        for (size_t i = 0; i < N / 2 + 1; i++) {
+            double freq = i * bin_hz;
+            if (freq < 100 || freq > 4000) continue;
+
+            double mag = sqrt(out[i][0] * out[i][0] + out[i][1] * out[i][1]);
+            if (mag > 1e-10) {  // ゼロ除算対策
+                geometric_mean_log += log(mag);
+                arithmetic_mean += mag;
+                count++;
+            }
+        }
+
+        if (count == 0) return 0.0;
+
+        geometric_mean_log /= count;
+        arithmetic_mean /= count;
+
+        double geometric_mean = exp(geometric_mean_log);
+        return geometric_mean / arithmetic_mean;
+    }
+
+    // メイン処理（改善版：より緩い判定）
+    bool process(const float* data, size_t n, double adaptive_threshold, double& rmsdata) {
+        double r = rms(data, n);
+        double z = zcr(data, n);
+        double sf = spectral_flatness(data, n);
+
+        rmsdata = r;
+
+        // 統計情報更新
+        stats.total_frames++;
+        stats.rms_min = std::min(stats.rms_min, r);
+        stats.rms_max = std::max(stats.rms_max, r);
+        stats.zcr_min = std::min(stats.zcr_min, z);
+        stats.zcr_max = std::max(stats.zcr_max, z);
+        stats.sf_min = std::min(stats.sf_min, sf);
+        stats.sf_max = std::max(stats.sf_max, sf);
+
+        // ============================================
+        // 改善1: より緩い判定条件
+        // ============================================
+
+        // RMS判定（より広い範囲）
+        bool rms_ok = (r > adaptive_threshold * 0.8) && (r < adaptive_threshold * 15.0);
+
+        // ZCR判定（範囲を広げる）
+        bool zcr_ok = (z > 0.05 && z < 0.60);  // 0.08-0.50 → 0.05-0.60
+
+        // スペクトル平坦度（★変更箇所：あなたの環境に合わせて大幅拡大）
+        // 変更前: bool sf_ok = (sf > 0.05 && sf < 0.40);
+        // 変更後: bool sf_ok = (sf > 0.05 && sf < 0.80);
+        bool sf_ok = (sf > 0.05 && sf < 0.80);  // ← ★ここが変更された
+
+        // ============================================
+        // 改善2: 段階的スコアリング（部分一致も許容）
+        // ============================================
+        double score = 0.0;
+
+        // RMSは必須（これがNGだと完全に0点）
+        if (!rms_ok) {
+            score = 0.0;
+        }
+        else {
+            // RMSがOKなら、他の条件で加点
+            score += 0.40;  // RMSだけで40点
+
+            if (zcr_ok) score += 0.30;  // ZCRで+30点
+            if (sf_ok) score += 0.30;   // SFで+30点
+        }
+
+        // ============================================
+        // デバッグ出力（色付き）
+        // ============================================
+        std::cout << std::fixed << std::setprecision(4);
+
+        // RMS表示
+        std::cout << "RMS=" << r << " [" << (adaptive_threshold * 0.8) << "-" << (adaptive_threshold * 15.0) << "]";
+        if (rms_ok) std::cout << " ✓"; else std::cout << " ✗";
+
+        // ZCR表示
+        std::cout << " | ZCR=" << z << " [0.05-0.60]";
+        if (zcr_ok) std::cout << " ✓"; else std::cout << " ✗";
+
+        // SF表示
+        std::cout << " | SF=" << sf << " [0.05-0.40]";
+        if (sf_ok) std::cout << " ✓"; else std::cout << " ✗";
+
+        // スコア表示
+        std::cout << " | Score=" << score;
+
+        // Pull/Release表示
+        std::cout << " | Pull=" << pull_score << " | Rel=" << release_score;
+
+        // ============================================
+        // 改善3: Pull/Releaseを緩和
+        // ============================================
+        if (score > 0.50) {  // 0.70 → 0.50（50%以上で判定）
+            pull_score += 1.0;
+            release_score = 0.0;
+        }
+        else {
+            release_score += 1.0;
+            pull_score *= 0.7;  // 0.6 → 0.7（減衰を緩やかに）
+        }
+
+        pull_score = std::min(pull_score, 10.0);
+
+        // ON/OFF判定（より素早く反応）
+        if (pull_score > 2.5) {  // 3.5 → 2.5（より速く検出）
+            is_active = true;
+            stats.detected_frames++;
+        }
+
+        if (release_score > 5.0) {  // 4.0 → 5.0（終了を遅らせる）
+            is_active = false;
+            pull_score = 0.0;
+        }
+
+        // 状態表示
+        if (is_active) {
+            std::cout << " | 🎤 SPEECH";
+        }
+        else {
+            std::cout << " | -- silent";
+        }
+
+        std::cout << std::endl;
+
+        return is_active;
+    }
+
+    // 統計情報を表示
+    void printStatistics() {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "VAD統計情報" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "総フレーム数: " << stats.total_frames << std::endl;
+        std::cout << "検出フレーム数: " << stats.detected_frames << " ("
+            << (100.0 * stats.detected_frames / std::max(1, stats.total_frames)) << "%)" << std::endl;
+        std::cout << "\nRMS範囲: [" << stats.rms_min << " - " << stats.rms_max << "]" << std::endl;
+        std::cout << "ZCR範囲: [" << stats.zcr_min << " - " << stats.zcr_max << "]" << std::endl;
+        std::cout << "SF範囲:  [" << stats.sf_min << " - " << stats.sf_max << "]" << std::endl;
+        std::cout << "========================================\n" << std::endl;
+    }
+
+    // 状態リセット
+    void reset() {
+        pull_score = 0.0;
+        release_score = 0.0;
+        is_active = false;
+        stats = Statistics();
+    }
+};
+
+// ============================================
+// あなたの環境専用VAD（統計から最適化）
+// ============================================
+
+class CustomOptimizedVAD {
+private:
+    int sample_rate;
+    double pull_score;
+    double release_score;
+    bool is_active;
+
+public:
+    CustomOptimizedVAD(int sr = 16000)
+        : sample_rate(sr), pull_score(0.0), release_score(0.0), is_active(false) {
+    }
+
+    // RMS計算
+    double rms(const float* data, size_t n) {
+        double s = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            s += double(data[i]) * double(data[i]);
+        }
+        return n ? std::sqrt(s / n) : 0.0;
+    }
+
+    // ZCR計算
+    double zcr(const float* data, size_t n) {
+        int zero_crossings = 0;
+        for (size_t i = 1; i < n; ++i) {
+            if ((data[i - 1] >= 0 && data[i] < 0) ||
+                (data[i - 1] < 0 && data[i] >= 0)) {
+                zero_crossings++;
+            }
+        }
+        return n ? double(zero_crossings) / double(n) : 0.0;
+    }
+
+    // スペクトル平坦度計算
+    double spectral_flatness(const float* data, size_t n) {
+        size_t N = n;
+        std::vector<double> in(N);
+        std::vector<fftw_complex> out(N / 2 + 1);
+
+        for (size_t i = 0; i < N; i++) {
+            in[i] = data[i];
+        }
+
+        fftw_plan p = fftw_plan_dft_r2c_1d((int)N, in.data(), out.data(), FFTW_ESTIMATE);
+        fftw_execute(p);
+        fftw_destroy_plan(p);
+
+        double geometric_mean_log = 0.0;
+        double arithmetic_mean = 0.0;
+        int count = 0;
+
+        // 100Hz - 4000Hz の範囲のみ使用
+        double bin_hz = (double)sample_rate / (double)N;
+
+        for (size_t i = 0; i < N / 2 + 1; i++) {
+            double freq = i * bin_hz;
+            if (freq < 100 || freq > 4000) continue;
+
+            double mag = sqrt(out[i][0] * out[i][0] + out[i][1] * out[i][1]);
+            if (mag > 1e-10) {  // ゼロ除算対策
+                geometric_mean_log += log(mag);
+                arithmetic_mean += mag;
+                count++;
+            }
+        }
+
+        if (count == 0) return 0.0;
+
+        geometric_mean_log /= count;
+        arithmetic_mean /= count;
+
+        double geometric_mean = exp(geometric_mean_log);
+        return geometric_mean / arithmetic_mean;
+    }
+
+    bool process(const float* data, size_t n, double adaptive_threshold, double& rmsdata) {
+        double r = rms(data, n);
+        double z = zcr(data, n);
+        double sf = spectral_flatness(data, n);
+
+        rmsdata = r;
+
+        // ============================================
+        // あなたの環境の実測値に基づいた判定
+        // ============================================
+
+        // RMS判定: 実測 0.0067-0.0979 → 余裕を持たせる
+        bool rms_ok = (r > adaptive_threshold * 0.5) && (r < 0.15);
+
+        // ZCR判定: 実測 0.0714-0.1442 → ピッタリの範囲
+        bool zcr_ok = (z > 0.06 && z < 0.20);  // 音声のZCRが低めの環境
+
+        // SF判定: 実測 0.2687-0.6798 → この範囲に合わせる
+        // ※ あなたの環境では高いSFが正常値
+        bool sf_ok = (sf > 0.20 && sf < 0.75);
+
+        // ============================================
+        // スコアリング（SFの重みを下げる）
+        // ============================================
+        double score = 0.0;
+
+        if (!rms_ok) {
+            score = 0.0;  // RMSは必須
+        }
+        else {
+            score += 0.50;  // RMSで50点
+
+            if (zcr_ok) score += 0.40;  // ZCRで+40点（重要）
+            if (sf_ok) score += 0.10;   // SFで+10点（参考程度）
+        }
+
+        // デバッグ出力
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "RMS=" << r << " [>" << (adaptive_threshold * 0.5) << "]";
+        if (rms_ok) std::cout << " ✓"; else std::cout << " ✗";
+
+        std::cout << " | ZCR=" << z << " [0.06-0.20]";
+        if (zcr_ok) std::cout << " ✓"; else std::cout << " ✗";
+
+        std::cout << " | SF=" << sf << " [0.20-0.75]";
+        if (sf_ok) std::cout << " ✓"; else std::cout << " ✗";
+
+        std::cout << " | Score=" << score << " | Pull=" << pull_score;
+
+        // Pull/Release
+        if (score > 0.60) {  // 60%以上で判定
+            pull_score += 1.0;
+            release_score = 0.0;
+        }
+        else {
+            release_score += 1.0;
+            pull_score *= 0.7;
+        }
+
+        pull_score = std::min(pull_score, 10.0);
+
+        if (pull_score > 2.0) {  // より速く反応
+            is_active = true;
+        }
+
+        if (release_score > 5.0) {
+            is_active = false;
+            pull_score = 0.0;
+        }
+
+        if (is_active) {
+            std::cout << " | 🎤 SPEECH";
+        }
+        else {
+            std::cout << " | -- silent";
+        }
+
+        std::cout << std::endl;
+
+        return is_active;
+    }
+
+    void reset() {
+        pull_score = 0.0;
+        release_score = 0.0;
+        is_active = false;
+    }
+
+};
+
+// ============================================
+// さらに簡単な方法：SF判定を無効化
+// ============================================
+
+class SimpleVAD_NoSF {
+private:
+    int sample_rate;
+    double pull_score;
+    double release_score;
+    bool is_active;
+
+public:
+    SimpleVAD_NoSF(int sr = 16000)
+        : sample_rate(sr), pull_score(0.0), release_score(0.0), is_active(false) {
+    }
+
+    // RMS計算
+    double rms(const float* data, size_t n) {
+        double s = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            s += double(data[i]) * double(data[i]);
+        }
+        return n ? std::sqrt(s / n) : 0.0;
+    }
+
+    // ZCR計算
+    double zcr(const float* data, size_t n) {
+        int zero_crossings = 0;
+        for (size_t i = 1; i < n; ++i) {
+            if ((data[i - 1] >= 0 && data[i] < 0) ||
+                (data[i - 1] < 0 && data[i] >= 0)) {
+                zero_crossings++;
+            }
+        }
+        return n ? double(zero_crossings) / double(n) : 0.0;
+    }
+
+    // スペクトル平坦度計算
+    double spectral_flatness(const float* data, size_t n) {
+        size_t N = n;
+        std::vector<double> in(N);
+        std::vector<fftw_complex> out(N / 2 + 1);
+
+        for (size_t i = 0; i < N; i++) {
+            in[i] = data[i];
+        }
+
+        fftw_plan p = fftw_plan_dft_r2c_1d((int)N, in.data(), out.data(), FFTW_ESTIMATE);
+        fftw_execute(p);
+        fftw_destroy_plan(p);
+
+        double geometric_mean_log = 0.0;
+        double arithmetic_mean = 0.0;
+        int count = 0;
+
+        // 100Hz - 4000Hz の範囲のみ使用
+        double bin_hz = (double)sample_rate / (double)N;
+
+        for (size_t i = 0; i < N / 2 + 1; i++) {
+            double freq = i * bin_hz;
+            if (freq < 100 || freq > 4000) continue;
+
+            double mag = sqrt(out[i][0] * out[i][0] + out[i][1] * out[i][1]);
+            if (mag > 1e-10) {  // ゼロ除算対策
+                geometric_mean_log += log(mag);
+                arithmetic_mean += mag;
+                count++;
+            }
+        }
+
+        if (count == 0) return 0.0;
+
+        geometric_mean_log /= count;
+        arithmetic_mean /= count;
+
+        double geometric_mean = exp(geometric_mean_log);
+        return geometric_mean / arithmetic_mean;
+    }
+
+    bool process(const float* data, size_t n, double adaptive_threshold, double& rmsdata) {
+        double r = rms(data, n);
+        double z = zcr(data, n);
+
+        rmsdata = r;
+
+        // ============================================
+        // SFを使わずにRMSとZCRだけで判定
+        // ============================================
+
+        bool rms_ok = (r > adaptive_threshold * 0.7) && (r < 0.15);
+        bool zcr_ok = (z > 0.06 && z < 0.20);
+
+        // 両方OKなら音声
+        double score = (rms_ok && zcr_ok) ? 1.0 : 0.0;
+
+        // Pull/Release
+        if (score > 0.9) {
+            pull_score += 1.0;
+            release_score = 0.0;
+        }
+        else {
+            release_score += 1.0;
+            pull_score *= 0.7;
+        }
+
+        pull_score = std::min(pull_score, 10.0);
+
+        if (pull_score >1.0) {
+            is_active = true;
+        }
+
+        if (release_score > 2.0) {
+            is_active = false;
+            pull_score = 0.0;
+        }
+
+        // 簡易デバッグ出力
+        if (is_active) {
+            std::cout << "🎤 RMS=" << r << " ZCR=" << z << std::endl;
+        }
+
+        return is_active;
+    }
+
+    void reset() {
+        pull_score = 0.0;
+        release_score = 0.0;
+        is_active = false;
+    }
+
+};
+
+
 class PulledVAD {
 public:
     PulledVAD(int sr = 16000)
@@ -1211,251 +1738,6 @@ void Enrollment_thread()
     }
 }
 
-void Enrollment_thread2()
-{
-    int silence_count = 0;
-    int active_count = 0;
-    std::vector<float> accumulated_chunk;
-    std::vector<double> recent_rms;
-
-    Config config;
-    config.sampleRate = 16000;
-    config.nMels = 80;
-    config.cudaDeviceId = 0;
-    config.useFP16 = false;
-    config.useCPUFallback = true;
-    config.minConfidence = 0.55;
-
-    std::string onnxModelPath = "speaker_resnet.onnx";
-    SpeakerSelectSystem system("speaker_models", onnxModelPath, config);
-
-    // ハイパスフィルターの初期化 (150Hz)
-    HighPassFilter hpf(150.0f, 16000.0f);
-    // ローパスフィルターの初期化 (4000Hz)
-    LowPassFilter lpf(4000.0f, 16000.0f);
-
-    while (!stop_flag) {
-        WriteUTF8("\n--- 新しい話者を登録 ---\n");
-        WriteUTF8("話者名を入力 (終了: 'quit'): ");
-
-        std::string speakerName = ReadUTF8Input();
-
-        if (speakerName == "quit" || speakerName == "q") {
-            break;
-        }
-        if (speakerName.empty()) {
-            WriteUTF8("⚠ 話者名を入力してください\n");
-            continue;
-        }
-
-        WriteUTF8("VOICEVOXを使いますか  0:使わない 1:使います");
-        std::string character = ReadUTF8Input();
-
-        // 状態をリセット
-        silence_count = 0;
-        active_count = 0;
-        bool recording_started = false;
-        int pre_speech_silence = 0;  // 録音開始前の連続無音カウント
-        accumulated_chunk.clear();
-        recent_rms.clear();
-
-        int chara  = std::stoi(character);
-
-        if (chara == 1) {
-
-            std::string speakID = ReadUTF8Input();
-
-            if (speakID.empty()) {
-                WriteUTF8("⚠ キャラクターNoを入力してください\n");
-                continue;
-            }
-
-            g_voice.style_id = std::stoi(speakID);
-
-
-            WriteUTF8("しゃべる文章を入力: ");
-            std::string speakString = ReadUTF8Input();
-
-            if (speakString.empty()) {
-                WriteUTF8("⚠ 文章を入力してください\n");
-                continue;
-            }
-
-            WriteUTF8("四国めたん\tあまあま\t0\n");
-            WriteUTF8("ずんだもん\tノーマル\t3\n");
-            WriteUTF8("春日部つむぎ\tノーマル\t8\n");
-            WriteUTF8("九州そら\tノーマル\t16\n");
-            WriteUTF8("もち子さん\tノーマル\t20\n");
-            WriteUTF8("\nキャラクターNoを入力: ");
-
-
-            // 音声キューとバッファをクリア
-            {
-                std::lock_guard<std::mutex> lk(qmutex);
-                while (!audio_queue.empty()) {
-                    audio_queue.pop();
-                }
-            }
-
-
-            if (!speakString.empty()) {
-                WriteUTF8("\n音声を再生します...\n");
-                g_voice.VoicePlay(speakString);
-
-                // 音声再生開始を待つ
-                Sleep(500);
-            }
-        }
-        else {
-
-            // 音声キューとバッファをクリア
-            {
-                std::lock_guard<std::mutex> lk(qmutex);
-                while (!audio_queue.empty()) {
-                    audio_queue.pop();
-                }
-            }
-
-            WriteUTF8("\n音声を待機中...(話し始めると自動で録音開始します)\n");
-
-            WriteUTF8("マイクに向かって喋ってください");
-        }
-
-
-
-        // 録音用の無音判定閾値
-        // ※ 0.5秒 × 4 = 2.0秒の無音で録音終了
-        // ※ 文中の短い間（Silence=1〜2）は継続、文末の長い無音で終了
-        const int RECORDING_SILENCE_LIMIT = 4;
-
-
-        while (!stop_flag) {
-
-            std::unique_lock<std::mutex> lk(qmutex);
-            qcv.wait(lk, [] { return !audio_queue.empty() || stop_flag.load(); });
-            if (stop_flag && audio_queue.empty()) break;
-
-            auto chunk = std::move(audio_queue.front());
-            audio_queue.pop();
-            lk.unlock();
-
-            if (chunk.empty()) continue;
-
-            // ハイパスフィルター適用 (足音対策)
-            hpf.process(chunk);
-            // ローパスフィルター適用 (拍手・食器音対策)
-            lpf.process(chunk);
-
-
-            double current_rms = rms(chunk.data(), chunk.size());
-            double adaptive_threshold = update_adaptive_rms_threshold(current_rms, recent_rms, 20, 2.5);
-
-            // 録音中は閾値を下げる（文末の小さい音も拾う）
-            double speech_threshold = recording_started ? adaptive_threshold * 0.7 : adaptive_threshold;
-
-            bool speech = is_speech(chunk.data(), chunk.size(), speech_threshold);
-
-            // 音声検出時の処理
-            if (speech) {
-                if (!recording_started) {
-                    recording_started = true;
-                    pre_speech_silence = 0;
-                    WriteUTF8("🎤 録音開始！\n");
-                }
-                silence_count = 0;
-                active_count++;
-            }
-            else {
-                // 無音検出
-                if (recording_started && active_count > 0) {
-                    // 録音開始後の無音をカウント
-                    silence_count++;
-                }
-                else if (!recording_started) {
-                    // 録音開始前の無音カウント（タイムアウト用）
-                    pre_speech_silence++;
-                }
-            }
-
-            // 録音開始後のみデータを蓄積
-            if (recording_started) {
-                accumulated_chunk.insert(accumulated_chunk.end(), chunk.begin(), chunk.end());
-            }
-
-            // タイムアウトチェック（30秒音声なし）
-            if (!recording_started && pre_speech_silence > 60) {  // 0.5秒 × 60 = 30秒
-                WriteUTF8("⚠ タイムアウト: 音声が検出されませんでした\n");
-                break;
-            }
-
-            if (recording_started) {
-                std::cout << "RMS=" << std::fixed << std::setprecision(4) << current_rms
-                    << "  Threshold=" << speech_threshold
-                    << "  Speech=" << speech
-                    << "  Active=" << active_count
-                    << "  Silence=" << silence_count
-                    << "  Duration=" << std::setprecision(1)
-                    << (accumulated_chunk.size() / (float)TARGET_RATE) << "s"
-                    << std::endl;
-            }
-
-            // 音声終了判定（無音が3秒続いたら終了）
-            const int RECORDING_SILENCE_LIMIT = 6;  // 0.5秒 × 6 = 3秒
-            if (silence_count >= RECORDING_SILENCE_LIMIT && active_count > 0 && recording_started) {
-                WriteUTF8("\n🛑 録音終了（無音検出）\n");
-
-                if (accumulated_chunk.size() >= TARGET_RATE * 0.5) {
-
-                    // 末尾の無音を削除（2.5秒分 = RECORDING_SILENCE_LIMIT - 1チャンク分の余裕）
-                    int silence_samples = static_cast<int>(TARGET_RATE * 2.5); // 2.5秒
-                    int trim_size = std::min(silence_samples, static_cast<int>(accumulated_chunk.size()) - TARGET_RATE / 2);
-
-                    if (trim_size > 0) {
-                        accumulated_chunk.resize(accumulated_chunk.size() - trim_size);
-                        std::cout << "末尾の無音を削除: " << (trim_size / (float)TARGET_RATE)
-                            << "秒 (残り: " << (accumulated_chunk.size() / (float)TARGET_RATE) << "秒)" << std::endl;
-                    }
-
-                    // UTF-8 → Shift-JIS変換してファイル名作成
-                    std::string filename_utf8 = speakerName + ".wav";
-                    std::string filename_sjis = utf8_to_sjis(filename_utf8);
-
-                    // Shift-JISのファイル名でWAVファイル保存
-                    bool saveResult = SaveWavFile2(filename_sjis.c_str(), accumulated_chunk);
-
-                    if (saveResult) {
-                        WriteUTF8("✓ 音声ファイル保存成功\n");
-
-                        // 話者登録（UTF-8の名前を使用）
-                        WriteUTF8("話者登録中...\n");
-                        bool enrollResult = system.enrollSpeaker(speakerName, accumulated_chunk);
-
-                        if (enrollResult) {
-                            WriteUTF8("✓ 話者登録成功\n");
-                        }
-                        else {
-                            WriteUTF8("✗ 話者登録失敗\n");
-                        }
-                    }
-                    else {
-                        WriteUTF8("✗ 音声ファイル保存失敗\n");
-                    }
-                }
-                else {
-                    WriteUTF8("⚠ 音声が短すぎます（最低0.5秒必要）\n");
-                }
-
-                // 次の登録に備えてリセット
-                accumulated_chunk.clear();
-                silence_count = 0;
-                active_count = 0;
-                break;
-            }
-        }
-    }
-
-    WriteUTF8("\n登録モードを終了します\n");
-}
 
 // ファイルの先頭付近に追加
 std::vector<float> trimTrailingSilence(const std::vector<float>& audio,
@@ -1526,7 +1808,12 @@ void worker_thread_func() {
 
     system.printSystemInfo();
 
-    static PulledVAD vad(16000);
+    //static PulledVAD vad(16000);
+    //static LightweightVAD vad(16000);
+    //static CustomOptimizedVAD vad(16000);
+    static SimpleVAD_NoSF vad(16000);
+
+
 
     int spekercount;
     if ((spekercount = system.getSpeakerCount()) == 0) {
@@ -1581,7 +1868,7 @@ void worker_thread_func() {
         adaptive_threshold = update_adaptive_rms_threshold(current_rms, recent_rms, 20, 2.5);
 
         // 録音中は閾値を下げる（文末の小さい音も拾う）
-        //double speech_threshold = recording_started ? adaptive_threshold * 0.7 : adaptive_threshold;
+        double speech_threshold = recording_started ? adaptive_threshold * 0.7 : adaptive_threshold;
 
         bool speech = is_speech(chunk.data(), chunk.size(), speech_threshold);
         //bool speech = vad.process(chunk.data(), chunk.size(), speech_threshold, current_rms);
@@ -1614,10 +1901,6 @@ void worker_thread_func() {
             else if (!recording_started) {
                 // 録音開始前の無音カウント（タイムアウト用）
                 pre_speech_silence++;
-                prev_chunk = chunk;
-
-                // 無音時じのデータデータで計算
-                adaptive_threshold = update_adaptive_rms_threshold(current_rms, recent_rms, 30, 2.5); // 1.5 -> 2.5, 20 -> 30 (登録モードと統一)
             }
         }
 
@@ -1627,7 +1910,7 @@ void worker_thread_func() {
         }
 
 
-        if (recording_started) {
+        //if (recording_started) {
 
             std::cout << "RMS=" << std::fixed << std::setprecision(4) << current_rms
                 << "  Threshold=" << speech_threshold
@@ -1635,7 +1918,7 @@ void worker_thread_func() {
                 << "  Active=" << active_count
                 << "  Silence=" << silence_count
                 << std::endl;
-        }
+        //}
 
 
         if (!speech) {
